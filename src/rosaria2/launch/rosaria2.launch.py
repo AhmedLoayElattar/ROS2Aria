@@ -2,8 +2,10 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -20,11 +22,14 @@ def generate_launch_description():
                               description='Base link frame ID'),
         DeclareLaunchArgument('cmd_vel_timeout', default_value='0.6',
                               description='Timeout (s) before stopping if no cmd_vel received'),
+        DeclareLaunchArgument('rviz', default_value='false',
+                              description='Launch RViz2 for visualization'),
 
         Node(
             package='rosaria2',
             executable='rosaria2_node',
             name='rosaria2',
+            namespace='ROSaria2',
             output='screen',
             parameters=[{
                 'port': LaunchConfiguration('port'),
@@ -34,5 +39,15 @@ def generate_launch_description():
                 'base_link_frame': LaunchConfiguration('base_link_frame'),
                 'cmd_vel_timeout': LaunchConfiguration('cmd_vel_timeout'),
             }],
+        ),
+
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            arguments=['-d', PathJoinSubstitution([
+                FindPackageShare('rosaria2'), 'rviz', 'rosaria2.rviz'
+            ])],
+            condition=IfCondition(LaunchConfiguration('rviz'))
         ),
     ])

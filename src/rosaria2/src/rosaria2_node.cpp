@@ -9,6 +9,7 @@
  * dynamic_reconfigure).
  */
 
+#include <Aria/ArGripper.h>
 #include <Aria/ArRobotConfigPacketReader.h>
 #include <Aria/Aria.h>
 
@@ -61,6 +62,20 @@ private:
       const std::shared_ptr<std_srvs::srv::Empty::Request> request,
       std::shared_ptr<std_srvs::srv::Empty::Response> response);
 
+  // Gripper service callbacks
+  void grip_open_cb(const std::shared_ptr<std_srvs::srv::Empty::Request>,
+                    std::shared_ptr<std_srvs::srv::Empty::Response>);
+  void grip_close_cb(const std::shared_ptr<std_srvs::srv::Empty::Request>,
+                     std::shared_ptr<std_srvs::srv::Empty::Response>);
+  void grip_lift_up_cb(const std::shared_ptr<std_srvs::srv::Empty::Request>,
+                       std::shared_ptr<std_srvs::srv::Empty::Response>);
+  void grip_lift_down_cb(const std::shared_ptr<std_srvs::srv::Empty::Request>,
+                         std::shared_ptr<std_srvs::srv::Empty::Response>);
+  void gripper_store_cb(const std::shared_ptr<std_srvs::srv::Empty::Request>,
+                        std::shared_ptr<std_srvs::srv::Empty::Response>);
+  void gripper_deploy_cb(const std::shared_ptr<std_srvs::srv::Empty::Request>,
+                         std::shared_ptr<std_srvs::srv::Empty::Response>);
+
   // Parameter callback
   rcl_interfaces::msg::SetParametersResult
   on_parameter_change(const std::vector<rclcpp::Parameter> &parameters);
@@ -77,6 +92,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr recharge_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr state_of_charge_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr motors_state_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr gripper_state_pub_;
 
   // Subscriber
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmdvel_sub_;
@@ -84,6 +100,12 @@ private:
   // Services
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr enable_srv_;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr disable_srv_;
+  rclcpp::Service<std_srvs::srv::Empty>::SharedPtr grip_open_srv_;
+  rclcpp::Service<std_srvs::srv::Empty>::SharedPtr grip_close_srv_;
+  rclcpp::Service<std_srvs::srv::Empty>::SharedPtr grip_lift_up_srv_;
+  rclcpp::Service<std_srvs::srv::Empty>::SharedPtr grip_lift_down_srv_;
+  rclcpp::Service<std_srvs::srv::Empty>::SharedPtr gripper_store_srv_;
+  rclcpp::Service<std_srvs::srv::Empty>::SharedPtr gripper_deploy_srv_;
 
   // Timers
   rclcpp::TimerBase::SharedPtr cmdvel_watchdog_timer_;
@@ -113,6 +135,7 @@ private:
   ArLaserConnector *laser_connector_;
   ArRobot *robot_;
   ArFunctorC<RosAriaNode> my_publish_cb_;
+  ArGripper *gripper_;
 
   // State
   rclcpp::Time veltime_;
@@ -132,11 +155,11 @@ private:
 };
 
 RosAriaNode::RosAriaNode()
-    : Node("rosaria2"), TicksMM_(-1), DriftFactor_(-99999), RevCount_(-1),
+    : Node("ROSaria2"), TicksMM_(-1), DriftFactor_(-99999), RevCount_(-1),
       conn_(nullptr), laser_connector_(nullptr), robot_(nullptr),
-      my_publish_cb_(this, &RosAriaNode::publish), sonar_enabled_(false),
-      publish_sonar_(false), publish_sonar_pointcloud2_(false),
-      published_motors_state_(false) {
+      my_publish_cb_(this, &RosAriaNode::publish), gripper_(nullptr),
+      sonar_enabled_(false), publish_sonar_(false),
+      publish_sonar_pointcloud2_(false), published_motors_state_(false) {
   // Declare parameters with defaults
   this->declare_parameter<std::string>(
       "port", "/dev/serial/by-id/usb-1a86_USB2.0-Ser_-if00-port0");
@@ -210,6 +233,30 @@ RosAriaNode::RosAriaNode()
   disable_srv_ = this->create_service<std_srvs::srv::Empty>(
       "disable_motors",
       std::bind(&RosAriaNode::disable_motors_cb, this, std::placeholders::_1,
+                std::placeholders::_2));
+
+  gripper_state_pub_ =
+      this->create_publisher<std_msgs::msg::Int8>("gripper_state", 100);
+
+  grip_open_srv_ = this->create_service<std_srvs::srv::Empty>(
+      "grip_open", std::bind(&RosAriaNode::grip_open_cb, this,
+                             std::placeholders::_1, std::placeholders::_2));
+  grip_close_srv_ = this->create_service<std_srvs::srv::Empty>(
+      "grip_close", std::bind(&RosAriaNode::grip_close_cb, this,
+                              std::placeholders::_1, std::placeholders::_2));
+  grip_lift_up_srv_ = this->create_service<std_srvs::srv::Empty>(
+      "grip_lift_up", std::bind(&RosAriaNode::grip_lift_up_cb, this,
+                                std::placeholders::_1, std::placeholders::_2));
+  grip_lift_down_srv_ = this->create_service<std_srvs::srv::Empty>(
+      "grip_lift_down",
+      std::bind(&RosAriaNode::grip_lift_down_cb, this, std::placeholders::_1,
+                std::placeholders::_2));
+  gripper_store_srv_ = this->create_service<std_srvs::srv::Empty>(
+      "gripper_store", std::bind(&RosAriaNode::gripper_store_cb, this,
+                                 std::placeholders::_1, std::placeholders::_2));
+  gripper_deploy_srv_ = this->create_service<std_srvs::srv::Empty>(
+      "gripper_deploy",
+      std::bind(&RosAriaNode::gripper_deploy_cb, this, std::placeholders::_1,
                 std::placeholders::_2));
 
   veltime_ = this->now();
@@ -407,6 +454,9 @@ int RosAriaNode::Setup() {
   bumpers_.front_bumpers.resize(robot_->getNumFrontBumpers(), false);
   bumpers_.rear_bumpers.resize(robot_->getNumRearBumpers(), false);
 
+  // Initialize Gripper
+  gripper_ = new ArGripper(robot_);
+
   // Run ArRobot background processing thread
   robot_->runAsync(true);
 
@@ -589,6 +639,13 @@ void RosAriaNode::publish() {
     published_motors_state_ = true;
   }
 
+  // Gripper state
+  if (gripper_) {
+    std_msgs::msg::Int8 g_state;
+    g_state.data = gripper_->getGripState();
+    gripper_state_pub_->publish(g_state);
+  }
+
   // Sonar
   if (publish_sonar_ || publish_sonar_pointcloud2_) {
     sensor_msgs::msg::PointCloud cloud;
@@ -640,6 +697,49 @@ void RosAriaNode::disable_motors_cb(
   robot_->lock();
   robot_->disableMotors();
   robot_->unlock();
+}
+
+void RosAriaNode::grip_open_cb(
+    const std::shared_ptr<std_srvs::srv::Empty::Request>,
+    std::shared_ptr<std_srvs::srv::Empty::Response>) {
+  RCLCPP_INFO(this->get_logger(), "Gripper open request");
+  if (gripper_)
+    gripper_->gripOpen();
+}
+void RosAriaNode::grip_close_cb(
+    const std::shared_ptr<std_srvs::srv::Empty::Request>,
+    std::shared_ptr<std_srvs::srv::Empty::Response>) {
+  RCLCPP_INFO(this->get_logger(), "Gripper close request");
+  if (gripper_)
+    gripper_->gripClose();
+}
+void RosAriaNode::grip_lift_up_cb(
+    const std::shared_ptr<std_srvs::srv::Empty::Request>,
+    std::shared_ptr<std_srvs::srv::Empty::Response>) {
+  RCLCPP_INFO(this->get_logger(), "Gripper lift up request");
+  if (gripper_)
+    gripper_->liftUp();
+}
+void RosAriaNode::grip_lift_down_cb(
+    const std::shared_ptr<std_srvs::srv::Empty::Request>,
+    std::shared_ptr<std_srvs::srv::Empty::Response>) {
+  RCLCPP_INFO(this->get_logger(), "Gripper lift down request");
+  if (gripper_)
+    gripper_->liftDown();
+}
+void RosAriaNode::gripper_store_cb(
+    const std::shared_ptr<std_srvs::srv::Empty::Request>,
+    std::shared_ptr<std_srvs::srv::Empty::Response>) {
+  RCLCPP_INFO(this->get_logger(), "Gripper store request");
+  if (gripper_)
+    gripper_->gripperStore();
+}
+void RosAriaNode::gripper_deploy_cb(
+    const std::shared_ptr<std_srvs::srv::Empty::Request>,
+    std::shared_ptr<std_srvs::srv::Empty::Response>) {
+  RCLCPP_INFO(this->get_logger(), "Gripper deploy request");
+  if (gripper_)
+    gripper_->gripperDeploy();
 }
 
 void RosAriaNode::cmdvel_cb(const geometry_msgs::msg::Twist::SharedPtr msg) {
