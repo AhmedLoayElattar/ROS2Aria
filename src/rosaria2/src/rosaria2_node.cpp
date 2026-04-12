@@ -29,7 +29,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
-#include "rosaria2/msg/bumper_state.hpp"
+#include <std_msgs/msg/u_int16.hpp>
 
 #include "rosaria2/laser_publisher.hpp"
 
@@ -82,9 +82,9 @@ private:
 
   void readParameters();
 
-  // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pose_pub_;
-  rclcpp::Publisher<rosaria2::msg::BumperState>::SharedPtr bumpers_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt16>::SharedPtr bumpers_front_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt16>::SharedPtr bumpers_rear_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr sonar_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
       sonar_pointcloud2_pub_;
@@ -145,9 +145,9 @@ private:
   bool publish_sonar_;
   bool publish_sonar_pointcloud2_;
   bool published_motors_state_;
+  bool was_disconnected_ = false;
 
   nav_msgs::msg::Odometry position_;
-  rosaria2::msg::BumperState bumpers_;
 
   // Parameter callback handle
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
@@ -207,8 +207,10 @@ RosAriaNode::RosAriaNode()
 
   // Create publishers
   pose_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("pose", 1000);
-  bumpers_pub_ =
-      this->create_publisher<rosaria2::msg::BumperState>("bumper_state", 1000);
+  bumpers_front_pub_ =
+      this->create_publisher<std_msgs::msg::UInt16>("bumper_state_front", 1000);
+  bumpers_rear_pub_ =
+      this->create_publisher<std_msgs::msg::UInt16>("bumper_state_rear", 1000);
   sonar_pub_ =
       this->create_publisher<sensor_msgs::msg::PointCloud>("sonar", 50);
   sonar_pointcloud2_pub_ =
@@ -418,12 +420,14 @@ int RosAriaNode::Setup() {
   }
 
   // Connect to the robot
+  robot_->setConnectionTimeoutTime(
+      500); // 500ms (missed 2 odometry packets) = instantaneous teardown
   conn_ = new ArRobotConnector(argparser, robot_);
   if (!conn_->connectRobot()) {
-    RCLCPP_ERROR(this->get_logger(),
-                 "RosAria2: ARIA could not connect to robot! "
-                 "(Check port parameter, permissions, or errors above)");
-    return 1;
+    RCLCPP_WARN(this->get_logger(),
+                "RosAria2: ARIA could not connect to robot! "
+                "(Check port parameter or USB connection. Waiting for USB...)");
+    return 2;
   }
 
   if (publish_aria_lasers_) {
@@ -449,10 +453,6 @@ int RosAriaNode::Setup() {
 
   // Register ARIA sensor interpretation callback
   robot_->addSensorInterpTask("ROSPublishingTask", 100, &my_publish_cb_);
-
-  // Initialize bumpers
-  bumpers_.front_bumpers.resize(robot_->getNumFrontBumpers(), false);
-  bumpers_.rear_bumpers.resize(robot_->getNumRearBumpers(), false);
 
   // Initialize Gripper
   gripper_ = new ArGripper(robot_);
@@ -518,25 +518,36 @@ int RosAriaNode::Setup() {
 }
 
 void RosAriaNode::check_connection() {
-  if (robot_ && !robot_->isConnected()) {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "Robot connection lost! Attempting to reconnect...");
+  if (robot_) {
+    // 1. Aggressive OS-level physical detachment check
+    if (robot_->getDeviceConnection()) {
+      const char *port_name = robot_->getDeviceConnection()->getPortName();
+      if (port_name && strlen(port_name) > 0) {
+        if (access(port_name, F_OK) != 0) {
+          RCLCPP_WARN(this->get_logger(),
+                      "RosAria2: Physical port %s vanished from OS! Instantly "
+                      "shutting down to release lock!",
+                      port_name);
+          robot_->getDeviceConnection()->close();
+          rclcpp::shutdown();
+          return;
+        }
+      }
+    }
 
-    robot_->stopRunning();
-    robot_->waitForRunExit();
+    // 2. ARIA packet timeout check
+    if (!robot_->isConnected()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "RosAria2: Hardware connection lost! Restarting node cleanly "
+                  "to check for USB replug...");
 
-    if (conn_->connectRobot()) {
-      RCLCPP_INFO(this->get_logger(), "Reconnected to robot.");
-
-      readParameters();
-      robot_->enableMotors();
-      if (sonar_enabled_) {
-        robot_->enableSonar();
-      } else {
-        robot_->disableSonar();
+      // Explicitly release the file descriptor so udev can cleanly drop the TTY
+      // port
+      if (robot_->getDeviceConnection()) {
+        robot_->getDeviceConnection()->close();
       }
 
-      robot_->runAsync(true);
+      rclcpp::shutdown();
     }
   }
 }
@@ -595,20 +606,14 @@ void RosAriaNode::publish() {
 
   // Bumpers
   int stall = robot_->getStallValue();
-  unsigned char front_bumpers = static_cast<unsigned char>(stall >> 8);
-  unsigned char rear_bumpers = static_cast<unsigned char>(stall);
 
-  bumpers_.header.frame_id = frame_id_bumper_;
-  bumpers_.header.stamp = this->now();
+  std_msgs::msg::UInt16 front_msg;
+  front_msg.data = static_cast<unsigned char>(stall >> 8);
+  bumpers_front_pub_->publish(front_msg);
 
-  for (unsigned int i = 0; i < robot_->getNumFrontBumpers(); i++) {
-    bumpers_.front_bumpers[i] = (front_bumpers & (1 << (i + 1))) != 0;
-  }
-  unsigned int num_rear = robot_->getNumRearBumpers();
-  for (unsigned int i = 0; i < num_rear; i++) {
-    bumpers_.rear_bumpers[i] = (rear_bumpers & (1 << (num_rear - i))) != 0;
-  }
-  bumpers_pub_->publish(bumpers_);
+  std_msgs::msg::UInt16 rear_msg;
+  rear_msg.data = static_cast<unsigned char>(stall);
+  bumpers_rear_pub_->publish(rear_msg);
 
   // Battery voltage
   std_msgs::msg::Float64 battery_voltage;
@@ -774,13 +779,20 @@ int main(int argc, char **argv) {
 
   auto node = std::make_shared<RosAriaNode>();
 
-  if (node->Setup() != 0) {
+  int setup_result = node->Setup();
+  if (setup_result == 1) {
     RCLCPP_FATAL(node->get_logger(), "RosAria2: Node setup failed...");
     rclcpp::shutdown();
     return -1;
+  } else if (setup_result == 2) {
+    // Clean exit requested (e.g. gracefully waiting for USB hardware)
+    rclcpp::shutdown();
+    return 0;
   }
 
-  rclcpp::spin(node);
+  if (rclcpp::ok()) {
+    rclcpp::spin(node);
+  }
   rclcpp::shutdown();
   return 0;
 }

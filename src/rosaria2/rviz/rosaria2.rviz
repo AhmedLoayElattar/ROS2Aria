@@ -60,7 +60,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /sonar_pointcloud2
+        Value: /ROSaria2/sonar_pointcloud2
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -100,12 +100,12 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /pose
+        Value: /ROSaria2/pose
       Value: true
   Enabled: true
   Global Options:
-    Background Color: 48; 48; 48
-    Fixed Frame: odom
+    Background Color: 20; 20; 50
+    Fixed Frame: base_link
     Frame Rate: 30
   Name: root
   Tools:

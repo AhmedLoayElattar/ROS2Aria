@@ -24,14 +24,6 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(Threads REQUIRED)
 
 # ───────────────────────────────────────────────
-# Generate custom messages
-# ───────────────────────────────────────────────
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/BumperState.msg"
-  DEPENDENCIES std_msgs
-)
-
-# ───────────────────────────────────────────────
 # Build AriaCoda as a static library
 # ───────────────────────────────────────────────
 set(ARIACODA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/AriaCoda")
@@ -89,10 +81,6 @@ ament_target_dependencies(rosaria2_node
 target_link_libraries(rosaria2_node
   aria_static
 )
-
-# Link with generated message typesupport
-rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(rosaria2_node ${cpp_typesupport_target})
 
 # ───────────────────────────────────────────────
 # Install

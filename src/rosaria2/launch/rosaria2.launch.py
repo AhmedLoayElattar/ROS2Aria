@@ -20,6 +20,8 @@ def generate_launch_description():
                               description='Odometry frame ID'),
         DeclareLaunchArgument('base_link_frame', default_value='base_link',
                               description='Base link frame ID'),
+        DeclareLaunchArgument('sonar_frame', default_value='sonar',
+                              description='Sonar frame ID'),
         DeclareLaunchArgument('cmd_vel_timeout', default_value='0.6',
                               description='Timeout (s) before stopping if no cmd_vel received'),
         DeclareLaunchArgument('rviz', default_value='false',
@@ -31,6 +33,8 @@ def generate_launch_description():
             name='rosaria2',
             namespace='ROSaria2',
             output='screen',
+            respawn=True,
+            respawn_delay=0.5,
             parameters=[{
                 'port': LaunchConfiguration('port'),
                 'baud': LaunchConfiguration('baud'),
@@ -49,5 +53,18 @@ def generate_launch_description():
                 FindPackageShare('rosaria2'), 'rviz', 'rosaria2.rviz'
             ])],
             condition=IfCondition(LaunchConfiguration('rviz'))
+        ),
+
+        # Add static transform for sonar so RViz can locate it relative to base_link
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link_to_sonar',
+            arguments=[
+                '--x', '0', '--y', '0', '--z', '0.2',
+                '--roll', '0', '--pitch', '0', '--yaw', '0',
+                '--frame-id', LaunchConfiguration('base_link_frame'),
+                '--child-frame-id', LaunchConfiguration('sonar_frame')
+            ]
         ),
     ])
