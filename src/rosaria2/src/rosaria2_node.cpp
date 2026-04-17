@@ -111,6 +111,7 @@ private:
   rclcpp::TimerBase::SharedPtr cmdvel_watchdog_timer_;
   rclcpp::TimerBase::SharedPtr sonar_timer_;
   rclcpp::TimerBase::SharedPtr reconnect_timer_;
+  rclcpp::TimerBase::SharedPtr publish_timer_;
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> odom_broadcaster_;
@@ -126,6 +127,7 @@ private:
   std::string frame_id_bumper_;
   std::string frame_id_sonar_;
   double cmdvel_timeout_secs_;
+  double publish_rate_;
 
   // Robot calibration
   int TicksMM_, DriftFactor_, RevCount_;
@@ -172,6 +174,7 @@ RosAriaNode::RosAriaNode()
   this->declare_parameter<std::string>("bumpers_frame", "bumpers");
   this->declare_parameter<std::string>("sonar_frame", "sonar");
   this->declare_parameter<double>("cmd_vel_timeout", 0.6);
+  this->declare_parameter<double>("publish_rate", 20.0);
 
   // Calibration parameters (set to 0 = use robot default)
   this->declare_parameter<int>("TicksMM", -1);
@@ -198,6 +201,7 @@ RosAriaNode::RosAriaNode()
   this->get_parameter("bumpers_frame", frame_id_bumper_);
   this->get_parameter("sonar_frame", frame_id_sonar_);
   this->get_parameter("cmd_vel_timeout", cmdvel_timeout_secs_);
+  this->get_parameter("publish_rate", publish_rate_);
 
   RCLCPP_INFO(this->get_logger(), "RosAria2: port: [%s]", serial_port_.c_str());
   if (serial_baud_ != 0) {
@@ -227,6 +231,28 @@ RosAriaNode::RosAriaNode()
 
   recharge_state_.data = -2;
   motors_state_.data = false;
+
+  // Initialize Odometry covariance (Pioneer 3DX defaults)
+  // [x, y, z, roll, pitch, yaw]
+  // Pose covariance
+  for (int i = 0; i < 36; i++) {
+    position_.pose.covariance[i] = 0.0;
+    position_.twist.covariance[i] = 0.0;
+  }
+  position_.pose.covariance[0] = 0.01;     // x
+  position_.pose.covariance[7] = 0.01;     // y
+  position_.pose.covariance[14] = 99999.0; // z
+  position_.pose.covariance[21] = 99999.0; // roll
+  position_.pose.covariance[28] = 99999.0; // pitch
+  position_.pose.covariance[35] = 0.05;    // yaw
+
+  // Twist covariance
+  position_.twist.covariance[0] = 0.01;     // vx
+  position_.twist.covariance[7] = 0.01;     // vy
+  position_.twist.covariance[14] = 99999.0; // vz
+  position_.twist.covariance[21] = 99999.0; // vroll
+  position_.twist.covariance[28] = 99999.0; // vpitch
+  position_.twist.covariance[35] = 0.05;    // vyaw
 
   // Services
   enable_srv_ = this->create_service<std_srvs::srv::Empty>(
@@ -451,8 +477,9 @@ int RosAriaNode::Setup() {
   robot_->enableMotors();
   robot_->disableSonar();
 
-  // Register ARIA sensor interpretation callback
-  robot_->addSensorInterpTask("ROSPublishingTask", 100, &my_publish_cb_);
+  // Register ARIA sensor interpretation callback is no longer used for
+  // publishing We now use a ROS timer for thread-safe publishing
+  // robot_->addSensorInterpTask("ROSPublishingTask", 100, &my_publish_cb_);
 
   // Initialize Gripper
   gripper_ = new ArGripper(robot_);
@@ -513,6 +540,13 @@ int RosAriaNode::Setup() {
   reconnect_timer_ = this->create_wall_timer(
       std::chrono::seconds(1), std::bind(&RosAriaNode::check_connection, this));
 
+  // Timer for thread-safe publishing (Decoupled from ARIA interp task)
+  if (publish_rate_ > 0.0) {
+    publish_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate_)),
+        std::bind(&RosAriaNode::publish, this));
+  }
+
   RCLCPP_INFO(this->get_logger(), "RosAria2: Setup complete");
   return 0;
 }
@@ -572,8 +606,23 @@ void RosAriaNode::sonar_check_subscribers() {
 }
 
 void RosAriaNode::publish() {
-  // Called from ArRobot background thread via SensorInterpTask
+  // Called from ROS timer callback
+  robot_->lock();
   ArPose pos = robot_->getPose();
+  ArTime pos_time = robot_->getLastOdometryTime();
+  double trans_vel = robot_->getVel();
+  double lat_vel = robot_->getLatVel();
+  double rot_vel = robot_->getRotVel();
+  double batt_volt = robot_->getRealBatteryVoltageNow();
+  int stall = robot_->getStallValue();
+  char charge_state = robot_->getChargeState();
+  bool motors_en = robot_->areMotorsEnabled();
+  bool have_soc = robot_->haveStateOfCharge();
+  float soc_val = (have_soc ? robot_->getStateOfCharge() / 100.0f : 0.0f);
+  robot_->unlock();
+
+  // Capture a single timestamp for consistency across message and TF
+  rclcpp::Time now = convertArTimeToROS(pos_time, this->get_clock());
 
   // Odometry
   tf2::Quaternion q;
@@ -584,18 +633,18 @@ void RosAriaNode::publish() {
   position_.pose.pose.position.z = 0.0;
   position_.pose.pose.orientation = tf2::toMsg(q);
 
-  position_.twist.twist.linear.x = robot_->getVel() / 1000.0;
-  position_.twist.twist.linear.y = robot_->getLatVel() / 1000.0;
-  position_.twist.twist.angular.z = robot_->getRotVel() * M_PI / 180.0;
+  position_.twist.twist.linear.x = trans_vel / 1000.0;
+  position_.twist.twist.linear.y = lat_vel / 1000.0;
+  position_.twist.twist.angular.z = rot_vel * M_PI / 180.0;
 
   position_.header.frame_id = frame_id_odom_;
   position_.child_frame_id = frame_id_base_link_;
-  position_.header.stamp = this->now();
+  position_.header.stamp = now;
   pose_pub_->publish(position_);
 
   // TF: odom -> base_link
   geometry_msgs::msg::TransformStamped odom_trans;
-  odom_trans.header.stamp = this->now();
+  odom_trans.header.stamp = now;
   odom_trans.header.frame_id = frame_id_odom_;
   odom_trans.child_frame_id = frame_id_base_link_;
   odom_trans.transform.translation.x = pos.getX() / 1000.0;
@@ -605,8 +654,6 @@ void RosAriaNode::publish() {
   odom_broadcaster_->sendTransform(odom_trans);
 
   // Bumpers
-  int stall = robot_->getStallValue();
-
   std_msgs::msg::UInt16 front_msg;
   front_msg.data = static_cast<unsigned char>(stall >> 8);
   bumpers_front_pub_->publish(front_msg);
@@ -617,29 +664,29 @@ void RosAriaNode::publish() {
 
   // Battery voltage
   std_msgs::msg::Float64 battery_voltage;
-  battery_voltage.data = robot_->getRealBatteryVoltageNow();
+  battery_voltage.data = batt_volt;
   voltage_pub_->publish(battery_voltage);
 
   // State of charge
-  if (robot_->haveStateOfCharge()) {
+  if (have_soc) {
     std_msgs::msg::Float32 soc;
-    soc.data = robot_->getStateOfCharge() / 100.0f;
+    soc.data = soc_val;
     state_of_charge_pub_->publish(soc);
   }
 
   // Recharge state
-  char s = robot_->getChargeState();
-  if (s != recharge_state_.data) {
-    RCLCPP_INFO(this->get_logger(), "Publishing new recharge state %d.", s);
-    recharge_state_.data = s;
+  if (charge_state != recharge_state_.data) {
+    RCLCPP_INFO(this->get_logger(), "Publishing new recharge state %d.",
+                charge_state);
+    recharge_state_.data = charge_state;
     recharge_state_pub_->publish(recharge_state_);
   }
 
   // Motors state
-  bool e = robot_->areMotorsEnabled();
-  if (e != motors_state_.data || !published_motors_state_) {
-    RCLCPP_INFO(this->get_logger(), "Publishing new motors state %d.", e);
-    motors_state_.data = e;
+  if (motors_en != motors_state_.data || !published_motors_state_) {
+    RCLCPP_INFO(this->get_logger(), "Publishing new motors state %d.",
+                motors_en);
+    motors_state_.data = motors_en;
     motors_state_pub_->publish(motors_state_);
     published_motors_state_ = true;
   }
@@ -654,7 +701,7 @@ void RosAriaNode::publish() {
   // Sonar
   if (publish_sonar_ || publish_sonar_pointcloud2_) {
     sensor_msgs::msg::PointCloud cloud;
-    cloud.header.stamp = this->now();
+    cloud.header.stamp = now;
     cloud.header.frame_id = frame_id_sonar_;
 
     for (int i = 0; i < robot_->getNumSonar(); i++) {
@@ -672,7 +719,10 @@ void RosAriaNode::publish() {
 
     if (publish_sonar_pointcloud2_) {
       sensor_msgs::msg::PointCloud2 cloud2;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
       sensor_msgs::convertPointCloudToPointCloud2(cloud, cloud2);
+#pragma GCC diagnostic pop
       sonar_pointcloud2_pub_->publish(cloud2);
     }
 
@@ -749,8 +799,8 @@ void RosAriaNode::gripper_deploy_cb(
 
 void RosAriaNode::cmdvel_cb(const geometry_msgs::msg::Twist::SharedPtr msg) {
   veltime_ = this->now();
-  RCLCPP_INFO(this->get_logger(), "New speed: [%.2f, %.2f] (%.3f)",
-              msg->linear.x * 1e3, msg->angular.z, veltime_.seconds());
+  RCLCPP_DEBUG(this->get_logger(), "New speed: [%.2f, %.2f] (%.3f)",
+               msg->linear.x * 1e3, msg->angular.z, veltime_.seconds());
 
   robot_->lock();
   robot_->setVel(msg->linear.x * 1e3);
