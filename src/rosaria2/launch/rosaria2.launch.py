@@ -31,6 +31,7 @@ def generate_launch_description():
             package='rosaria2',
             executable='rosaria2_node',
             name='rosaria2',
+            namespace='ROSaria2',
             output='screen',
             respawn=True,
             respawn_delay=0.5,
