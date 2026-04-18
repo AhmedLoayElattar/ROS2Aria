@@ -17,6 +17,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud_conversion.hpp>
@@ -93,6 +94,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr state_of_charge_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr motors_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr gripper_state_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
 
   // Subscriber
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmdvel_sub_;
@@ -138,6 +140,8 @@ private:
   ArRobot *robot_;
   ArFunctorC<RosAriaNode> my_publish_cb_;
   ArGripper *gripper_;
+  ArArgumentBuilder *args_;
+  ArArgumentParser *argparser_;
 
   // State
   rclcpp::Time veltime_;
@@ -147,19 +151,20 @@ private:
   bool publish_sonar_;
   bool publish_sonar_pointcloud2_;
   bool published_motors_state_;
-  bool was_disconnected_ = false;
 
   nav_msgs::msg::Odometry position_;
 
   // Parameter callback handle
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
       param_cb_handle_;
+  std::vector<std::unique_ptr<LaserPublisher>> laser_publishers_;
 };
 
 RosAriaNode::RosAriaNode()
     : Node("ROSaria2"), TicksMM_(-1), DriftFactor_(-99999), RevCount_(-1),
       conn_(nullptr), laser_connector_(nullptr), robot_(nullptr),
       my_publish_cb_(this, &RosAriaNode::publish), gripper_(nullptr),
+      args_(nullptr), argparser_(nullptr),
       sonar_enabled_(false), publish_sonar_(false),
       publish_sonar_pointcloud2_(false), published_motors_state_(false) {
   // Declare parameters with defaults
@@ -210,7 +215,7 @@ RosAriaNode::RosAriaNode()
   }
 
   // Create publishers
-  pose_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("pose", 1000);
+  pose_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", 1000);
   bumpers_front_pub_ =
       this->create_publisher<std_msgs::msg::UInt16>("bumper_state_front", 1000);
   bumpers_rear_pub_ =
@@ -228,6 +233,8 @@ RosAriaNode::RosAriaNode()
       "battery_state_of_charge", 100);
   motors_state_pub_ = this->create_publisher<std_msgs::msg::Bool>(
       "motors_state", rclcpp::QoS(5).transient_local());
+  joint_state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
+      "joint_states", 100);
 
   recharge_state_.data = -2;
   motors_state_.data = false;
@@ -299,6 +306,28 @@ RosAriaNode::~RosAriaNode() {
     robot_->disableSonar();
     robot_->stopRunning();
     robot_->waitForRunExit();
+    delete robot_;
+    robot_ = nullptr;
+  }
+  if (conn_) {
+    delete conn_;
+    conn_ = nullptr;
+  }
+  if (laser_connector_) {
+    delete laser_connector_;
+    laser_connector_ = nullptr;
+  }
+  if (gripper_) {
+    delete gripper_;
+    gripper_ = nullptr;
+  }
+  if (argparser_) {
+    delete argparser_;
+    argparser_ = nullptr;
+  }
+  if (args_) {
+    delete args_;
+    args_ = nullptr;
   }
   Aria::shutdown();
 }
@@ -417,38 +446,38 @@ rcl_interfaces::msg::SetParametersResult RosAriaNode::on_parameter_change(
 
 int RosAriaNode::Setup() {
   robot_ = new ArRobot();
-  ArArgumentBuilder *args = new ArArgumentBuilder();
-  ArArgumentParser *argparser = new ArArgumentParser(args);
-  argparser->loadDefaultArguments();
+  args_ = new ArArgumentBuilder();
+  argparser_ = new ArArgumentParser(args_);
+  argparser_->loadDefaultArguments();
 
   // Parse port: if it contains ':', treat as hostname:tcpport
   size_t colon_pos = serial_port_.find(":");
   if (colon_pos != std::string::npos) {
-    args->add("-remoteHost");
-    args->add(serial_port_.substr(0, colon_pos).c_str());
-    args->add("-remoteRobotTcpPort");
-    args->add(serial_port_.substr(colon_pos + 1).c_str());
+    args_->add("-remoteHost");
+    args_->add(serial_port_.substr(0, colon_pos).c_str());
+    args_->add("-remoteRobotTcpPort");
+    args_->add(serial_port_.substr(colon_pos + 1).c_str());
   } else {
-    args->add("-robotPort %s", serial_port_.c_str());
+    args_->add("-robotPort %s", serial_port_.c_str());
   }
 
   if (serial_baud_ != 0) {
-    args->add("-robotBaud %d", serial_baud_);
+    args_->add("-robotBaud %d", serial_baud_);
   }
 
   if (debug_aria_) {
-    args->add("-robotLogPacketsReceived");
-    args->add("-robotLogPacketsSent");
-    args->add("-robotLogVelocitiesReceived");
-    args->add("-robotLogMovementSent");
-    args->add("-robotLogMovementReceived");
+    args_->add("-robotLogPacketsReceived");
+    args_->add("-robotLogPacketsSent");
+    args_->add("-robotLogVelocitiesReceived");
+    args_->add("-robotLogMovementSent");
+    args_->add("-robotLogMovementReceived");
     ArLog::init(ArLog::File, ArLog::Verbose, aria_log_filename_.c_str(), true);
   }
 
   // Connect to the robot
   robot_->setConnectionTimeoutTime(
       500); // 500ms (missed 2 odometry packets) = instantaneous teardown
-  conn_ = new ArRobotConnector(argparser, robot_);
+  conn_ = new ArRobotConnector(argparser_, robot_);
   if (!conn_->connectRobot()) {
     RCLCPP_WARN(this->get_logger(),
                 "RosAria2: ARIA could not connect to robot! "
@@ -457,7 +486,7 @@ int RosAriaNode::Setup() {
   }
 
   if (publish_aria_lasers_) {
-    laser_connector_ = new ArLaserConnector(argparser, robot_, conn_);
+    laser_connector_ = new ArLaserConnector(argparser_, robot_, conn_);
   }
 
   // Load robot-specific parameters
@@ -513,7 +542,8 @@ int RosAriaNode::Setup() {
           this->get_logger(),
           "Creating publisher for laser #%d named %s with tf frame name %s", ln,
           l->getName(), tfname.c_str());
-      new LaserPublisher(l, shared_from_this(), true, tfname);
+      laser_publishers_.push_back(std::make_unique<LaserPublisher>(
+          l, shared_from_this(), true, tfname, frame_id_base_link_));
     }
     robot_->unlock();
     RCLCPP_INFO(this->get_logger(), "Done creating laser publishers");

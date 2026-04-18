@@ -11,9 +11,11 @@ inline rclcpp::Time convertArTimeToROS(const ArTime& t, rclcpp::Clock::SharedPtr
   // to adjust the time stamp in ROS time vs. now accordingly.
   ArTime arianow;
   const double dtsec = static_cast<double>(t.mSecSince(arianow)) / 1000.0;
+  // t.mSecSince(arianow) is negative if t is in the past.
+  // now.seconds() + dtsec will give a time in the past.
   rclcpp::Time now = clock->now();
   return rclcpp::Time(
-    static_cast<int64_t>((now.seconds() - dtsec) * 1e9),
+    static_cast<int64_t>((now.seconds() + dtsec) * 1e9),
     RCL_ROS_TIME);
 }
 
